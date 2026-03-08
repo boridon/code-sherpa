@@ -1,0 +1,25 @@
+<svg width="512" height="512" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-opacity="0.16"/>
+    </filter>
+  </defs>
+
+  <path
+    d="M100 28
+       Q106 28 110 35
+       L175 151
+       Q180 160 169 160
+       L31 160
+       Q20 160 25 151
+       L90 35
+       Q94 28 100 28 Z"
+    fill="#4F46E5"
+    filter="url(#softShadow)"
+  />
+
+  <circle cx="100" cy="110" r="27" fill="white"/>
+
+  <text x="100" y="117" font-size="20" text-anchor="middle" fill="#4F46E5"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">&lt;/&gt;</text>
+</svg>

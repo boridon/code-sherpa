@@ -1,0 +1,41 @@
+services:
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: code-sherpa
+    restart: unless-stopped
+    environment:
+      PORT: "${PORT:-8787}"
+      MCP_SERVER_NAME: "${MCP_SERVER_NAME:-code-sherpa}"
+      MCP_SERVER_VERSION: "${MCP_SERVER_VERSION:-0.1.0}"
+      SSH_HOST: "${SSH_HOST:-192.0.2.17}"
+      SSH_PORT: "${SSH_PORT:-22}"
+      SSH_USERNAME: "${SSH_USERNAME:-readonly_user}"
+      SSH_PRIVATE_KEY_PATH: "${SSH_PRIVATE_KEY_PATH:-/run/secrets/id_ed25519}"
+      SSH_KNOWN_HOSTS_PATH: "${SSH_KNOWN_HOSTS_PATH:-/run/secrets/known_hosts}"
+      SSH_READY_TIMEOUT_MS: "${SSH_READY_TIMEOUT_MS:-10000}"
+      SSH_EXEC_TIMEOUT_MS: "${SSH_EXEC_TIMEOUT_MS:-15000}"
+      REPO_ROOT: "${REPO_ROOT:-/srv/repos/project-repo}"
+      MAX_FILE_BYTES: "${MAX_FILE_BYTES:-100000}"
+      MAX_SEARCH_RESULTS: "${MAX_SEARCH_RESULTS:-100}"
+      MAX_LOG_COMMITS: "${MAX_LOG_COMMITS:-30}"
+      MAX_RESPONSE_CHARS: "${MAX_RESPONSE_CHARS:-200000}"
+      DENY_PATH_SEGMENTS: "${DENY_PATH_SEGMENTS:-.git,node_modules,dist,build,.next,.turbo,.cache,.env,.env.local,.env.production,.ssh}"
+      MCP_BEARER_TOKEN: "${MCP_BEARER_TOKEN:-replace-with-a-secure-token}"
+      OAUTH_ISSUER_BASE_URL: "${OAUTH_ISSUER_BASE_URL:?OAUTH_ISSUER_BASE_URL is required}"
+      OAUTH_LOGIN_USERNAME: "${OAUTH_LOGIN_USERNAME:?OAUTH_LOGIN_USERNAME is required}"
+      OAUTH_LOGIN_PASSWORD: "${OAUTH_LOGIN_PASSWORD:?OAUTH_LOGIN_PASSWORD is required}"
+      OAUTH_SESSION_SECRET: "${OAUTH_SESSION_SECRET:?OAUTH_SESSION_SECRET is required}"
+      OAUTH_COOKIE_SECURE: "${OAUTH_COOKIE_SECURE:-true}"
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./secrets/id_ed25519:/run/secrets/id_ed25519:ro
+      - ./secrets/known_hosts:/run/secrets/known_hosts:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
