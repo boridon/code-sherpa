@@ -1,6 +1,6 @@
 import { generateRandomToken } from "./pkce.js";
 
-export type OAuthScope = "mcp:read";
+export type OAuthScope = "mcp:read" | "mcp:write";
 
 export type AuthorizationRequest = {
   id: string;

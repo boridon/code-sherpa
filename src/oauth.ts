@@ -23,13 +23,13 @@ export type McpAuthResult = {
 };
 
 const COOKIE_NAME = "code_sherpa_session";
-const ALLOWED_SCOPES: OAuthScope[] = ["mcp:read"];
+const ALLOWED_SCOPES: OAuthScope[] = ["mcp:read", "mcp:write"];
 const REQUIRED_MCP_SCOPE: OAuthScope = "mcp:read";
 const AUTH_REQUEST_TTL_MS = 10 * 60 * 1000;
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000;
 const ACCESS_TOKEN_TTL_SEC = 3600;
 const REFRESH_TOKEN_TTL_SEC = 60 * 60 * 24 * 30;
-const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
 export function createOAuthModule(options: CreateOAuthModuleOptions) {
   const issuer = trimTrailingSlash(options.issuerBaseUrl);
@@ -89,7 +89,21 @@ export function createOAuthModule(options: CreateOAuthModuleOptions) {
       return;
     }
 
-    res.redirect(302, `/oauth/consent?request_id=${encodeURIComponent(authRequest.id)}`);
+    // Auto-approve consent for authenticated sessions to avoid repeated consent screens
+    store.removeAuthorizationRequest(authRequest.id);
+    const authCode = store.issueAuthorizationCode(authRequest, userSession.userId, AUTH_CODE_TTL_MS);
+    options.logger("oauth_auto_consent", {
+      clientId: authRequest.clientId,
+      userId: userSession.userId,
+      redirectUri: authRequest.redirectUri,
+    });
+
+    const successRedirect = appendQuery(authRequest.redirectUri, {
+      code: authCode.code,
+      state: authRequest.state,
+      iss: issuer,
+    });
+    res.redirect(302, successRedirect);
   });
 
   router.get("/login", (req, res) => {
@@ -570,10 +584,10 @@ function parseAuthorizeRequest(req: Request):
     return { ok: false, message: "code_challenge_method must be S256" };
   }
 
-  const requestedScopeRaw = getFirstString(req.query.scope) ?? "mcp:read";
+  const requestedScopeRaw = getFirstString(req.query.scope) ?? "mcp:read mcp:write";
   const scopes = parseScopes(requestedScopeRaw);
   if (!isValidScopeSet(scopes)) {
-    return { ok: false, message: "scope is invalid; only mcp:read is supported" };
+    return { ok: false, message: "scope is invalid; supported scopes are mcp:read and mcp:write" };
   }
 
   return {
@@ -595,7 +609,7 @@ function parseScopes(scopeText: string): OAuthScope[] {
   return scopeText
     .split(/\s+/)
     .map((scope) => scope.trim())
-    .filter((scope): scope is OAuthScope => scope.length > 0 && scope === "mcp:read");
+    .filter((scope): scope is OAuthScope => scope === "mcp:read" || scope === "mcp:write");
 }
 
 function isValidScopeSet(scopes: OAuthScope[]): boolean {
@@ -633,7 +647,7 @@ function buildDiscoveryDocument(issuer: string, authorizationEndpoint: string, t
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"],
-    scopes_supported: ["mcp:read"],
+    scopes_supported: ["mcp:read", "mcp:write"],
     authorization_response_iss_parameter_supported: true,
   };
 }

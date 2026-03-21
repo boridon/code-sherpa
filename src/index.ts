@@ -32,10 +32,11 @@ const SSH_KNOWN_HOSTS_PATH = process.env.SSH_KNOWN_HOSTS_PATH ?? "/run/secrets/k
 const SSH_READY_TIMEOUT_MS = intFromEnv("SSH_READY_TIMEOUT_MS", 10000, { min: 1000, max: 120000 });
 const SSH_EXEC_TIMEOUT_MS = intFromEnv("SSH_EXEC_TIMEOUT_MS", 15000, { min: 1000, max: 300000 });
 const REPO_ROOT = process.env.REPO_ROOT ?? "/srv/repos/project-repo";
-const MAX_FILE_BYTES = intFromEnv("MAX_FILE_BYTES", 100_000, { min: 1, max: 10_000_000 });
+const MAX_FILE_BYTES = intFromEnv("MAX_FILE_BYTES", 100_000, { min: 1, max: 100_000_000 });
+const MAX_WRITE_BYTES = intFromEnv("MAX_WRITE_BYTES", 100_000, { min: 1, max: 100_000_000 });
 const MAX_SEARCH_RESULTS = intFromEnv("MAX_SEARCH_RESULTS", 100, { min: 1, max: 2000 });
 const MAX_LOG_COMMITS = intFromEnv("MAX_LOG_COMMITS", 30, { min: 1, max: 500 });
-const MAX_RESPONSE_CHARS = intFromEnv("MAX_RESPONSE_CHARS", 200_000, { min: 1_000, max: 2_000_000 });
+const MAX_RESPONSE_CHARS = intFromEnv("MAX_RESPONSE_CHARS", 200_000, { min: 1_000, max: 20_000_000 });
 const MCP_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN?.trim();
 const OAUTH_ISSUER_BASE_URL = requiredStringFromEnv("OAUTH_ISSUER_BASE_URL");
 const OAUTH_LOGIN_USERNAME = requiredStringFromEnv("OAUTH_LOGIN_USERNAME");
@@ -98,7 +99,8 @@ app.use("/mcp", (req, res, next) => {
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
-  audit("mcp_auth_success", { source: authResult.source, subject: authResult.subject });
+  audit("mcp_auth_success", { source: authResult.source, subject: authResult.subject, scopes: authResult.scopes });
+  res.locals.authScopes = authResult.scopes ?? [];
   next();
 });
 
@@ -125,7 +127,8 @@ app.post("/mcp", async (req, res) => {
       return;
     }
 
-    const server = createMcpServer();
+    const scopes: string[] = res.locals.authScopes ?? [];
+    const server = createMcpServer({ hasWriteScope: scopes.includes("mcp:write") });
     let transport: StreamableHTTPServerTransport;
     transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
@@ -135,7 +138,10 @@ app.post("/mcp", async (req, res) => {
       },
     });
 
+    let closing = false;
     transport.onclose = () => {
+      if (closing) return;
+      closing = true;
       const sessionId = transport.sessionId;
       if (sessionId) {
         sessions.delete(sessionId);
@@ -244,7 +250,7 @@ async function shutdown() {
   process.exit(0);
 }
 
-function createMcpServer(): McpServer {
+function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   const server = new McpServer({
     name: MCP_SERVER_NAME,
     version: MCP_SERVER_VERSION,
@@ -562,7 +568,174 @@ function createMcpServer(): McpServer {
     },
   );
 
+  if (opts.hasWriteScope) {
+
+  server.registerTool(
+    "write_file",
+    {
+      description:
+        "Create or overwrite a file in the repository. Content is written atomically via a temp file. " +
+        "Subject to deny-path filtering and size limits.",
+      inputSchema: {
+        path: z.string().min(1).max(2000),
+        content: z.string().max(MAX_WRITE_BYTES),
+      },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ path: inputPath, content }) => {
+      try {
+        const safePath = normalizeRepoRelativePath(inputPath);
+        const contentBytes = Buffer.byteLength(content, "utf8");
+        if (contentBytes > MAX_WRITE_BYTES) {
+          throw new Error(`Content exceeds MAX_WRITE_BYTES (${contentBytes} > ${MAX_WRITE_BYTES})`);
+        }
+
+        const script = [
+          "set -euo pipefail",
+          `cd ${shQuote(REPO_ROOT)}`,
+          `mkdir -p $(dirname ${shQuote(safePath)})`,
+          `tmp=$(mktemp ${shQuote(safePath + ".XXXXXX")})`,
+          `cat > "$tmp"`,
+          `mv -f "$tmp" ${shQuote(safePath)}`,
+          `wc -c < ${shQuote(safePath)}`,
+        ].join("\n");
+
+        const result = await runRemoteScriptWithStdin(script, content);
+        const writtenBytes = Number.parseInt(result.stdout.trim(), 10);
+
+        audit("write_file", { path: safePath, contentBytes, writtenBytes });
+        return okToolResult({
+          repoRoot: REPO_ROOT,
+          path: safePath,
+          writtenBytes: Number.isFinite(writtenBytes) ? writtenBytes : contentBytes,
+          stderr: clipText(result.stderr),
+          exitCode: result.code,
+        });
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "delete_file",
+    {
+      description: "Delete a file from the repository. Subject to deny-path filtering.",
+      inputSchema: {
+        path: z.string().min(1).max(2000),
+      },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ path: inputPath }) => {
+      try {
+        const safePath = normalizeRepoRelativePath(inputPath);
+
+        const script = [
+          "set -euo pipefail",
+          `cd ${shQuote(REPO_ROOT)}`,
+          `[ -f ${shQuote(safePath)} ] || { echo "File not found: ${safePath}" >&2; exit 1; }`,
+          `rm -f ${shQuote(safePath)}`,
+          `echo "deleted"`,
+        ].join("\n");
+
+        const result = await runRemoteScript(script);
+
+        audit("delete_file", { path: safePath });
+        return okToolResult({
+          repoRoot: REPO_ROOT,
+          path: safePath,
+          deleted: true,
+          stderr: clipText(result.stderr),
+          exitCode: result.code,
+        });
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  } // end if (opts.hasWriteScope)
+
   return server;
+}
+
+async function runRemoteScriptWithStdin(script: string, stdin: string): Promise<RemoteResult> {
+  audit("ssh_exec_begin", { scriptPreview: clipText(script, 200), hasStdin: true });
+  return new Promise<RemoteResult>((resolve, reject) => {
+    const conn = new Client();
+    let stdout = "";
+    let stderr = "";
+    let finished = false;
+
+    const timeout = setTimeout(() => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      conn.end();
+      reject(new Error(`SSH command timeout after ${SSH_EXEC_TIMEOUT_MS}ms`));
+    }, SSH_EXEC_TIMEOUT_MS);
+
+    const settle = (fn: () => void) => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      clearTimeout(timeout);
+      conn.end();
+      fn();
+    };
+
+    conn.on("ready", () => {
+      const command = `bash -lc ${shQuote(script)}`;
+      conn.exec(command, (err, stream) => {
+        if (err) {
+          settle(() => reject(err));
+          return;
+        }
+
+        stream.on("data", (chunk: Buffer | string) => {
+          stdout += chunk.toString();
+        });
+
+        stream.stderr.on("data", (chunk: Buffer | string) => {
+          stderr += chunk.toString();
+        });
+
+        stream.on("close", (code: number | null, signal: string | null) => {
+          settle(() => {
+            if (code !== 0) {
+              reject(new Error(`Remote command failed (code=${code}, signal=${signal ?? "none"}): ${clipText(stderr)}`));
+              return;
+            }
+            const output: RemoteResult = { stdout, stderr, code, signal };
+            audit("ssh_exec_done", {
+              code,
+              signal,
+              stdoutBytes: Buffer.byteLength(stdout, "utf8"),
+              stderrBytes: Buffer.byteLength(stderr, "utf8"),
+            });
+            resolve(output);
+          });
+        });
+
+        stream.end(stdin);
+      });
+    });
+
+    conn.on("error", (err) => {
+      settle(() => reject(err));
+    });
+
+    conn.connect({
+      host: SSH_HOST,
+      port: SSH_PORT,
+      username: SSH_USERNAME,
+      privateKey: SSH_PRIVATE_KEY,
+      readyTimeout: SSH_READY_TIMEOUT_MS,
+      hostVerifier: verifyHostKey,
+    });
+  });
 }
 
 async function runRemoteScript(script: string): Promise<RemoteResult> {
