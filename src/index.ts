@@ -568,6 +568,161 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
     },
   );
 
+  server.registerTool(
+    "search_files",
+    {
+      description:
+        "Search for files in the repository by filename pattern (glob or partial name match). " +
+        "Patterns without wildcard characters are treated as partial matches (e.g. 'config' matches 'webpack.config.js'). " +
+        "Excludes .git, node_modules, and other denied paths.",
+      inputSchema: {
+        pattern: z.string().min(1).max(300),
+        path: z.string().min(1).max(2000).optional(),
+        maxResults: z.number().int().min(1).max(2000).optional(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ pattern, path: inputPath, maxResults }) => {
+      try {
+        const safePath = normalizeRepoRelativePath(inputPath ?? ".");
+        const maxItems = clamp(maxResults ?? 50, 1, MAX_SEARCH_RESULTS);
+
+        // Wrap bare strings in wildcards for partial-match behaviour
+        const namePattern = /[*?[]/.test(pattern) ? pattern : `*${pattern}*`;
+        const pruneExpr = DENY_PATH_SEGMENTS.map((segment) => shellJoin(["-name", segment])).join(" -o ");
+
+        const script = [
+          "set -euo pipefail",
+          `cd ${shQuote(REPO_ROOT)}`,
+          `find ${shQuote(safePath)} \\( ${pruneExpr} \\) -prune -o -type f -name ${shQuote(namePattern)} -print | sed 's#^\\./##'`,
+        ].join("\n");
+
+        const result = await runRemoteScript(script);
+        const allFiles = result.stdout
+          .split(/\r?\n/)
+          .map((f) => f.trim())
+          .filter((f) => f.length > 0)
+          .filter((f) => !containsDeniedSegment(f));
+
+        const limitedFiles = allFiles.slice(0, maxItems);
+        return okToolResult({
+          repoRoot: REPO_ROOT,
+          pattern,
+          path: safePath,
+          total: allFiles.length,
+          returned: limitedFiles.length,
+          truncated: allFiles.length > limitedFiles.length,
+          files: limitedFiles,
+          stderr: clipText(result.stderr),
+          exitCode: result.code,
+        });
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_symbols",
+    {
+      description:
+        "List symbols (functions, classes, types, interfaces, enums, exports) in a file with line numbers. " +
+        "Optimised for TypeScript/JavaScript.",
+      inputSchema: {
+        path: z.string().min(1).max(2000),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ path: inputPath }) => {
+      try {
+        const safePath = normalizeRepoRelativePath(inputPath);
+
+        // Match common TS/JS top-level declaration patterns
+        const pattern = [
+          "^[[:space:]]*(export[[:space:]]+)?(default[[:space:]]+)?(async[[:space:]]+)?function[[:space:]]+[a-zA-Z_$]",
+          "^[[:space:]]*(export[[:space:]]+)?(abstract[[:space:]]+)?class[[:space:]]+[a-zA-Z_$]",
+          "^[[:space:]]*(export[[:space:]]+)?const[[:space:]]+[a-zA-Z_$]",
+          "^[[:space:]]*(export[[:space:]]+)?type[[:space:]]+[a-zA-Z_$]",
+          "^[[:space:]]*(export[[:space:]]+)?interface[[:space:]]+[a-zA-Z_$]",
+          "^[[:space:]]*(export[[:space:]]+)?enum[[:space:]]+[a-zA-Z_$]",
+        ].join("|");
+
+        const script = [
+          "set -euo pipefail",
+          `cd ${shQuote(REPO_ROOT)}`,
+          `[ -f ${shQuote(safePath)} ] || { echo "File not found: ${safePath}" >&2; exit 1; }`,
+          `grep -nE ${shQuote(pattern)} ${shQuote(safePath)} || true`,
+        ].join("\n");
+
+        const result = await runRemoteScript(script);
+        const symbols = result.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trimEnd())
+          .filter((line) => line.length > 0);
+
+        return okToolResult({
+          repoRoot: REPO_ROOT,
+          path: safePath,
+          total: symbols.length,
+          symbols,
+          stderr: clipText(result.stderr),
+          exitCode: result.code,
+        });
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "git_blame",
+    {
+      description:
+        "Show per-line commit information for a repository file using git blame. " +
+        "Returns porcelain-format output for structured parsing.",
+      inputSchema: {
+        path: z.string().min(1).max(2000),
+        startLine: z.number().int().min(1).max(2_000_000).optional(),
+        endLine: z.number().int().min(1).max(2_000_000).optional(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ path: inputPath, startLine, endLine }) => {
+      try {
+        const safePath = normalizeRepoRelativePath(inputPath);
+
+        if (startLine !== undefined && endLine !== undefined && endLine < startLine) {
+          throw new Error("endLine must be greater than or equal to startLine");
+        }
+
+        const rangeFlag =
+          startLine !== undefined || endLine !== undefined
+            ? `-L ${shQuote(`${startLine ?? 1},${endLine ?? (startLine ?? 1) + 2000}`)}`
+            : "";
+
+        const script = [
+          "set -euo pipefail",
+          `cd ${shQuote(REPO_ROOT)}`,
+          `[ -f ${shQuote(safePath)} ] || { echo "File not found: ${safePath}" >&2; exit 1; }`,
+          `git blame ${rangeFlag} --porcelain -- ${shQuote(safePath)}`,
+        ].join("\n");
+
+        const result = await runRemoteScript(script);
+        return okToolResult({
+          repoRoot: REPO_ROOT,
+          path: safePath,
+          startLine: startLine ?? null,
+          endLine: endLine ?? null,
+          blame: clipText(result.stdout),
+          stderr: clipText(result.stderr),
+          exitCode: result.code,
+        });
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
   if (opts.hasWriteScope) {
 
   server.registerTool(
@@ -600,7 +755,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
           `wc -c < ${shQuote(safePath)}`,
         ].join("\n");
 
-        const result = await runRemoteScriptWithStdin(script, content);
+        const result = await withRetry("write_file", () => runRemoteScriptWithStdin(script, content));
         const writtenBytes = Number.parseInt(result.stdout.trim(), 10);
 
         audit("write_file", { path: safePath, contentBytes, writtenBytes });
@@ -638,7 +793,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
           `echo "deleted"`,
         ].join("\n");
 
-        const result = await runRemoteScript(script);
+        const result = await withRetry("delete_file", () => runRemoteScript(script));
 
         audit("delete_file", { path: safePath });
         return okToolResult({
@@ -647,6 +802,78 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
           deleted: true,
           stderr: clipText(result.stderr),
           exitCode: result.code,
+        });
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "patch_file",
+    {
+      description:
+        "Replace a specific string in a repository file. " +
+        "oldContent must match exactly once; the replacement is written atomically via a temp file. " +
+        "Subject to deny-path filtering and size limits.",
+      inputSchema: {
+        path: z.string().min(1).max(2000),
+        oldContent: z.string().min(1).max(MAX_WRITE_BYTES),
+        newContent: z.string().max(MAX_WRITE_BYTES),
+      },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ path: inputPath, oldContent, newContent }) => {
+      try {
+        const safePath = normalizeRepoRelativePath(inputPath);
+
+        // Step 1: read the file and verify size
+        const readScript = [
+          "set -euo pipefail",
+          `cd ${shQuote(REPO_ROOT)}`,
+          `[ -f ${shQuote(safePath)} ] || { echo "File not found: ${safePath}" >&2; exit 1; }`,
+          `fileSize=$(wc -c < ${shQuote(safePath)})`,
+          `if [ "$fileSize" -gt ${MAX_WRITE_BYTES} ]; then`,
+          `  echo "File exceeds MAX_WRITE_BYTES ($fileSize > ${MAX_WRITE_BYTES})" >&2; exit 1`,
+          `fi`,
+          `cat ${shQuote(safePath)}`,
+        ].join("\n");
+
+        const readResult = await withRetry("patch_file:read", () => runRemoteScript(readScript));
+        const originalContent = readResult.stdout;
+
+        const occurrences = originalContent.split(oldContent).length - 1;
+        if (occurrences === 0) {
+          throw new Error("oldContent not found in file");
+        }
+        if (occurrences > 1) {
+          throw new Error(`oldContent matches ${occurrences} locations; must be unique`);
+        }
+
+        const patchedContent = originalContent.replace(oldContent, newContent);
+
+        // Step 2: write back atomically
+        const writeScript = [
+          "set -euo pipefail",
+          `cd ${shQuote(REPO_ROOT)}`,
+          `tmp=$(mktemp ${shQuote(safePath + ".XXXXXX")})`,
+          `cat > "$tmp"`,
+          `mv -f "$tmp" ${shQuote(safePath)}`,
+          `wc -c < ${shQuote(safePath)}`,
+        ].join("\n");
+
+        const writeResult = await withRetry("patch_file:write", () =>
+          runRemoteScriptWithStdin(writeScript, patchedContent),
+        );
+        const writtenBytes = Number.parseInt(writeResult.stdout.trim(), 10);
+
+        audit("patch_file", { path: safePath, writtenBytes });
+        return okToolResult({
+          repoRoot: REPO_ROOT,
+          path: safePath,
+          writtenBytes: Number.isFinite(writtenBytes) ? writtenBytes : Buffer.byteLength(patchedContent, "utf8"),
+          stderr: clipText(writeResult.stderr),
+          exitCode: writeResult.code,
         });
       } catch (error) {
         return errorToolResult(error);
@@ -941,6 +1168,32 @@ function errorToolResult(error: unknown) {
       },
     ],
   };
+}
+
+const RETRY_DELAYS_MS = [500, 1000, 2000] as const;
+
+function isRetryableError(error: unknown): boolean {
+  const msg = stringifyError(error).toLowerCase();
+  if (msg.includes("timeout")) return true;
+  const code = (error as NodeJS.ErrnoException)?.code ?? "";
+  return (["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENOTCONN", "EPIPE"] as string[]).includes(code);
+}
+
+async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const delayMs = RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined || !isRetryableError(error)) {
+        throw error;
+      }
+      audit("retry_attempt", { label, attempt: attempt + 1, delayMs, error: stringifyError(error) });
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  // unreachable, but satisfies the type checker
+  throw new Error("withRetry: exhausted retries");
 }
 
 function readRequiredFile(filePath: string, label: string): string {
