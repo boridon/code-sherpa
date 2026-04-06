@@ -10,17 +10,29 @@
 ---
 
 ## CodeSherpa とは
-CodeSherpa は、SSH 越しにリポジトリを安全に参照するためのリモート MCP サーバーです。  
-読み取り専用ツールセットで動作します。
+CodeSherpa は、SSH 越しにリポジトリを安全に探索・編集するためのリモート MCP サーバーです。  
+1 つのインスタンスから複数リポジトリを提供できます。
 
 対応している MCP ツール:
-- `healthcheck_remote`
-- `list_files`
-- `read_file`
-- `search_code`
-- `git_status`
-- `git_diff`
-- `git_log`
+
+| ツール | 説明 | スコープ |
+|--------|------|----------|
+| `list_repos` | 利用可能なリポジトリ一覧 | read |
+| `healthcheck_remote` | SSH 接続とリポジトリの健全性チェック | read |
+| `list_files` | ファイル/ディレクトリ一覧（拒否パスフィルタ付き） | read |
+| `read_file` | ファイル内容の読み取り（サイズ制限付き） | read |
+| `search_code` | テキスト検索（再帰 grep） | read |
+| `search_files` | ファイル名パターン検索（glob） | read |
+| `get_symbols` | 関数/クラス/型の宣言を抽出 | read |
+| `git_status` | Git ステータス | read |
+| `git_diff` | Git diff（範囲/パス指定可） | read |
+| `git_log` | Git コミットログ | read |
+| `git_blame` | 行ごとのコミット情報 | read |
+| `write_file` | ファイルの作成・上書き（アトミック） | write |
+| `delete_file` | ファイルの削除 | write |
+| `patch_file` | ファイル内の文字列置換 | write |
+
+書き込みツールは、OAuth トークンに `mcp:write` スコープが含まれている場合のみ利用可能です。
 
 対応クライアント例:
 - ChatGPT（custom connectors）
@@ -49,6 +61,20 @@ https://your-domain.example/mcp
 SSH 接続に使用する秘密鍵と `known_hosts` は、`secrets/` ディレクトリに配置する必要があります。  
 詳細は「Docker デプロイ」セクションを参照してください。
 
+## 複数リポジトリ対応
+1 つの CodeSherpa インスタンスで複数リポジトリを提供できます。`REPO_ROOTS` で設定します。
+
+```env
+REPO_ROOTS=frontend:/srv/repos/frontend,backend:/srv/repos/backend,infra:/srv/repos/infra
+```
+
+形式: `名前1:/パス1,名前2:/パス2,...`
+
+- すべてのツールに `repo` パラメータがあり、対象リポジトリを選択できます。
+- `repo` を省略すると、最初に定義されたリポジトリがデフォルトで使用されます。
+- `list_repos` で利用可能なリポジトリを確認できます。
+- 単一リポジトリの場合は、従来の `REPO_ROOT` も引き続き利用可能です。
+
 ## アーキテクチャ
 ```text
 MCP クライアント
@@ -57,24 +83,25 @@ MCP クライアント
 CodeSherpa (HTTPS)
     |
     v
-SSH (読み取り専用ユーザー)
+SSH (読み取り専用 or 読み書きユーザー)
     |
     v
-プライベートリポジトリホスト
+プライベートリポジトリホスト (1つ以上のリポジトリ)
 ```
 
 ポイント:
 - リポジトリの実体は SSH 接続先ホストに残ります。
-- CodeSherpa は read-only の MCP ツールのみ公開します。
+- デフォルトは読み取り専用。書き込みツールには `mcp:write` OAuth スコープが必要です。
 - パストラバーサルと機微なパスセグメントをブロックします。
 - OAuth アクセストークンと固定 Bearer トークンの両方を利用できます。
 
 ## セキュリティモデル
-- SSH ユーザーは read-only（sudo なし）を推奨します。
+- SSH ユーザーは最小権限で作成してください（読み取り専用推奨、書き込みが必要な場合のみ許可）。
 - `.git`、`.env`、`node_modules` など機微なパスは拒否します。
 - 絶対パスと `..` を使ったパストラバーサルを拒否します。
 - `/mcp` では OAuth 利用時に `mcp:read` スコープを要求します。
-- 固定 Bearer 認証は内部テスト用として併用できます。
+- 書き込みツール（`write_file`、`delete_file`、`patch_file`）は `mcp:write` スコープが必要です。
+- 固定 Bearer 認証は内部テスト用として併用できます（読み取り専用スコープのみ）。
 
 注記: 現在の OAuth セッション、認可コード、トークンはメモリ保持です。コンテナ再起動で消えます。
 
@@ -147,7 +174,7 @@ OAuth エンドポイント:
 
 OAuth プロファイル:
 - Grant type: Authorization Code + PKCE（`S256`）
-- Scope: `mcp:read`
+- Scopes: `mcp:read`（読み取り専用）、`mcp:read mcp:write`（読み書き）
 - Public client: 対応（`token_endpoint_auth_method=none` を許可）
 - Refresh token: 対応
 
@@ -156,7 +183,7 @@ OAuth プロファイル:
 - Issuer: `https://code-sherpa.example.com`
 - Authorization endpoint: `https://code-sherpa.example.com/authorize`
 - Token endpoint: `https://code-sherpa.example.com/token`
-- Scope: `mcp:read`
+- Scope: `mcp:read`（書き込みが必要な場合は `mcp:write` を追加）
 
 ## 環境変数
 `.env.example` をベースに設定してください。
@@ -165,19 +192,23 @@ OAuth プロファイル:
 - `SSH_HOST`
 - `SSH_PORT`
 - `SSH_USERNAME`
-- `REPO_ROOT`
+- `REPO_ROOT` または `REPO_ROOTS`（いずれか 1 つ以上）
 - `MCP_BEARER_TOKEN`（任意の legacy/manual テスト用）
 - `OAUTH_ISSUER_BASE_URL`
 - `OAUTH_LOGIN_USERNAME`
 - `OAUTH_LOGIN_PASSWORD`
 - `OAUTH_SESSION_SECRET`
 
+リポジトリ設定:
+- `REPO_ROOT` — 単一リポジトリのパス（従来方式）
+- `REPO_ROOTS` — 複数リポジトリを `名前1:/パス1,名前2:/パス2` 形式で指定（`REPO_ROOT` より優先）
+
 任意（よく使うもの）:
 - `PORT`（デフォルト `8787`）
 - `MCP_SERVER_NAME`（デフォルト `code-sherpa`）
 - `MCP_SERVER_VERSION`（デフォルト `0.1.0`）
 - `OAUTH_COOKIE_SECURE`（デフォルト `true`）
-- `MAX_FILE_BYTES`、`MAX_SEARCH_RESULTS`、`MAX_LOG_COMMITS`、`MAX_RESPONSE_CHARS`
+- `MAX_FILE_BYTES`、`MAX_WRITE_BYTES`、`MAX_SEARCH_RESULTS`、`MAX_LOG_COMMITS`、`MAX_RESPONSE_CHARS`
 
 `.env` 例（安全なプレースホルダ）:
 
@@ -187,7 +218,7 @@ MCP_SERVER_NAME=code-sherpa
 SSH_HOST=ssh-host.example.internal
 SSH_PORT=22
 SSH_USERNAME=repo_reader
-REPO_ROOT=/srv/repos/project
+REPO_ROOTS=frontend:/srv/repos/frontend,backend:/srv/repos/backend
 OAUTH_ISSUER_BASE_URL=https://code-sherpa.example.com
 OAUTH_LOGIN_USERNAME=replace-me
 OAUTH_LOGIN_PASSWORD=replace-me
