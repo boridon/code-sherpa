@@ -31,7 +31,11 @@ const SSH_PRIVATE_KEY_PATH = process.env.SSH_PRIVATE_KEY_PATH ?? "/run/secrets/i
 const SSH_KNOWN_HOSTS_PATH = process.env.SSH_KNOWN_HOSTS_PATH ?? "/run/secrets/known_hosts";
 const SSH_READY_TIMEOUT_MS = intFromEnv("SSH_READY_TIMEOUT_MS", 10000, { min: 1000, max: 120000 });
 const SSH_EXEC_TIMEOUT_MS = intFromEnv("SSH_EXEC_TIMEOUT_MS", 15000, { min: 1000, max: 300000 });
-const REPO_ROOT = process.env.REPO_ROOT ?? "/srv/repos/project-repo";
+type RepoEntry = { name: string; root: string };
+
+const REPO_MAP: Map<string, string> = parseRepoRoots();
+const REPO_LIST: RepoEntry[] = [...REPO_MAP.entries()].map(([name, root]) => ({ name, root }));
+const DEFAULT_REPO = REPO_LIST[0];
 const MAX_FILE_BYTES = intFromEnv("MAX_FILE_BYTES", 100_000, { min: 1, max: 100_000_000 });
 const MAX_WRITE_BYTES = intFromEnv("MAX_WRITE_BYTES", 100_000, { min: 1, max: 100_000_000 });
 const MAX_SEARCH_RESULTS = intFromEnv("MAX_SEARCH_RESULTS", 100, { min: 1, max: 2000 });
@@ -77,7 +81,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     server: MCP_SERVER_NAME,
     version: MCP_SERVER_VERSION,
-    repoRoot: REPO_ROOT,
+    repos: REPO_LIST.map((r) => ({ name: r.name, root: r.root })),
     ssh: {
       host: SSH_HOST,
       port: SSH_PORT,
@@ -221,7 +225,7 @@ const httpServer = app.listen(PORT, "0.0.0.0", () => {
     port: PORT,
     mcpServerName: MCP_SERVER_NAME,
     mcpServerVersion: MCP_SERVER_VERSION,
-    repoRoot: REPO_ROOT,
+    repos: REPO_LIST.map((r) => ({ name: r.name, root: r.root })),
     sshHost: SSH_HOST,
     sshPort: SSH_PORT,
     sshUser: SSH_USERNAME,
@@ -251,30 +255,75 @@ async function shutdown() {
 }
 
 function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
-  const server = new McpServer({
-    name: MCP_SERVER_NAME,
-    version: MCP_SERVER_VERSION,
-  });
-  const gitBaseArgs = ["git", "-c", "safe.directory=*", "-C", REPO_ROOT];
+  const repoNames = REPO_LIST.map((r) => r.name);
+  const repoSummary = REPO_LIST.map((r) => `  - "${r.name}" (${r.root})`).join("\n");
+  const repoHint = REPO_LIST.length > 1
+    ? ` This server manages multiple repositories: ${repoNames.join(", ")}. Use the "repo" parameter to select which repository (defaults to "${DEFAULT_REPO.name}").`
+    : "";
+  const desc = (base: string) => base + repoHint;
+
+  const server = new McpServer(
+    {
+      name: MCP_SERVER_NAME,
+      version: MCP_SERVER_VERSION,
+    },
+    {
+      instructions:
+        `This server provides access to ${REPO_LIST.length} repositor${REPO_LIST.length === 1 ? "y" : "ies"} via SSH.\n` +
+        `Available repositories:\n${repoSummary}\n\n` +
+        `Most tools accept an optional "repo" parameter to select which repository to operate on. ` +
+        `If omitted, the default repository "${DEFAULT_REPO.name}" is used. ` +
+        `Use the "list_repos" tool to discover available repositories.`,
+    },
+  );
+
+  const repoNameSchema = z.string().min(1).max(100).optional()
+    .describe(`Repository name. Available: ${repoNames.join(", ")}. Defaults to "${DEFAULT_REPO.name}".`);
+
+  const gitBaseArgs = (repoRoot: string) => ["git", "-c", "safe.directory=*", "-C", repoRoot];
 
   server.registerTool(
-    "healthcheck_remote",
+    "list_repos",
     {
-      description: "Check SSH connectivity and basic repository health on remote host.",
+      description: "List all available repositories that can be accessed through this server.",
       annotations: { readOnlyHint: true },
     },
     async () => {
       try {
+        return okToolResult({
+          repos: REPO_LIST.map((r) => ({ name: r.name, root: r.root })),
+          default: DEFAULT_REPO.name,
+        });
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "healthcheck_remote",
+    {
+      description: desc("Check SSH connectivity and basic repository health on remote host."),
+      inputSchema: {
+        repo: repoNameSchema,
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ repo: repoName }) => {
+      try {
+        const repo = resolveRepo(repoName);
+        const gba = gitBaseArgs(repo.root);
         const hostname = await runRemoteScript("hostname");
-        const repoExists = await runRemoteScript(`[ -d ${shQuote(REPO_ROOT)} ] && echo true || echo false`);
+        const repoExists = await runRemoteScript(`[ -d ${shQuote(repo.root)} ] && echo true || echo false`);
         const isGitRepo = await runRemoteScript(
-          `${shellJoin([...gitBaseArgs, "rev-parse", "--is-inside-work-tree"])} 2>/dev/null || echo false`,
+          `${shellJoin([...gba, "rev-parse", "--is-inside-work-tree"])} 2>/dev/null || echo false`,
         );
         const payload = {
           ok: true,
           host: SSH_HOST,
           hostname: hostname.stdout.trim(),
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           repoExists: repoExists.stdout.trim() === "true",
           isGitRepo: isGitRepo.stdout.trim() === "true",
         };
@@ -288,14 +337,19 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "git_status",
     {
-      description: "Get git status in the target repository.",
+      description: desc("Get git status in the target repository."),
+      inputSchema: {
+        repo: repoNameSchema,
+      },
       annotations: { readOnlyHint: true },
     },
-    async () => {
+    async ({ repo: repoName }) => {
       try {
-        const result = await runRemoteScript(shellJoin([...gitBaseArgs, "status", "--short", "--branch"]));
+        const repo = resolveRepo(repoName);
+        const result = await runRemoteScript(shellJoin([...gitBaseArgs(repo.root), "status", "--short", "--branch"]));
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           stdout: clipText(result.stdout),
           stderr: clipText(result.stderr),
           exitCode: result.code,
@@ -309,19 +363,21 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "git_diff",
     {
-      description: "Get git diff from repository. Optionally specify commit range and path.",
+      description: desc("Get git diff from repository. Optionally specify commit range and path."),
       inputSchema: {
+        repo: repoNameSchema,
         range: z.string().min(1).max(200).optional(),
         path: z.string().min(1).max(2000).optional(),
         contextLines: z.number().int().min(0).max(50).optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ range, path: inputPath, contextLines }) => {
+    async ({ repo: repoName, range, path: inputPath, contextLines }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = inputPath ? normalizeRepoRelativePath(inputPath) : undefined;
         const unified = clamp(contextLines ?? 3, 0, 50);
-        const args = [...gitBaseArgs, "diff", "--no-color", `--unified=${unified}`];
+        const args = [...gitBaseArgs(repo.root), "diff", "--no-color", `--unified=${unified}`];
         if (range) {
           args.push(range);
         }
@@ -331,7 +387,8 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const result = await runRemoteScript(shellJoin(args));
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           range: range ?? null,
           path: safePath ?? null,
           stdout: clipText(result.stdout),
@@ -347,18 +404,20 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "git_log",
     {
-      description: "Get recent git commit log for the repository.",
+      description: desc("Get recent git commit log for the repository."),
       inputSchema: {
+        repo: repoNameSchema,
         limit: z.number().int().min(1).max(500).optional(),
         path: z.string().min(1).max(2000).optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ limit, path: inputPath }) => {
+    async ({ repo: repoName, limit, path: inputPath }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = inputPath ? normalizeRepoRelativePath(inputPath) : undefined;
         const finalLimit = clamp(limit ?? MAX_LOG_COMMITS, 1, MAX_LOG_COMMITS);
-        const args = [...gitBaseArgs, "log", "--no-color", `--max-count=${finalLimit}`, "--date=iso-strict", "--pretty=format:%h %ad %an %s"];
+        const args = [...gitBaseArgs(repo.root), "log", "--no-color", `--max-count=${finalLimit}`, "--date=iso-strict", "--pretty=format:%h %ad %an %s"];
         if (safePath) {
           args.push("--", safePath);
         }
@@ -369,7 +428,8 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
           .map((line) => line.trimEnd())
           .filter((line) => line.length > 0);
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           count: lines.length,
           commits: lines,
           stderr: clipText(result.stderr),
@@ -384,16 +444,18 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "list_files",
     {
-      description: "List files/directories under repository path with deny-path filtering.",
+      description: desc("List files/directories under repository path with deny-path filtering."),
       inputSchema: {
+        repo: repoNameSchema,
         path: z.string().min(1).max(2000).optional(),
         depth: z.number().int().min(1).max(12).optional(),
         limit: z.number().int().min(1).max(2000).optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ path: inputPath, depth, limit }) => {
+    async ({ repo: repoName, path: inputPath, depth, limit }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath ?? ".");
         const maxDepth = clamp(depth ?? 4, 1, 12);
         const maxItems = clamp(limit ?? MAX_SEARCH_RESULTS, 1, MAX_SEARCH_RESULTS);
@@ -403,7 +465,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const script = [
           "set -euo pipefail",
-          `cd ${shQuote(REPO_ROOT)}`,
+          `cd ${shQuote(repo.root)}`,
           `target=${shQuote(target)}`,
           "if [ -f \"$target\" ]; then",
           "  printf '%s\\n' \"$target\"",
@@ -421,7 +483,8 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const limitedItems = allItems.slice(0, maxItems);
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           path: safePath,
           depth: maxDepth,
           total: allItems.length,
@@ -440,22 +503,24 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "read_file",
     {
-      description: "Read a repository file (read-only, with size limit and deny-path filtering).",
+      description: desc("Read a repository file (read-only, with size limit and deny-path filtering)."),
       inputSchema: {
+        repo: repoNameSchema,
         path: z.string().min(1).max(2000),
         startLine: z.number().int().min(1).max(2_000_000).optional(),
         endLine: z.number().int().min(1).max(2_000_000).optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ path: inputPath, startLine, endLine }) => {
+    async ({ repo: repoName, path: inputPath, startLine, endLine }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath);
 
         const statResult = await runRemoteScript(
           [
             "set -euo pipefail",
-            `cd ${shQuote(REPO_ROOT)}`,
+            `cd ${shQuote(repo.root)}`,
             `target=${shQuote(safePath)}`,
             "[ -f \"$target\" ]",
             "wc -c < \"$target\"",
@@ -480,18 +545,19 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
           textResult = await runRemoteScript(
             [
               "set -euo pipefail",
-              `cd ${shQuote(REPO_ROOT)}`,
+              `cd ${shQuote(repo.root)}`,
               `sed -n ${shQuote(`${from},${to}p`)} ${shQuote(safePath)}`,
             ].join("\n"),
           );
         } else {
           textResult = await runRemoteScript(
-            ["set -euo pipefail", `cd ${shQuote(REPO_ROOT)}`, `cat ${shQuote(safePath)}`].join("\n"),
+            ["set -euo pipefail", `cd ${shQuote(repo.root)}`, `cat ${shQuote(safePath)}`].join("\n"),
           );
         }
 
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           path: safePath,
           fileBytes,
           startLine: startLine ?? null,
@@ -509,16 +575,18 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "search_code",
     {
-      description: "Search text in repository using recursive grep with result limit.",
+      description: desc("Search text in repository using recursive grep with result limit."),
       inputSchema: {
+        repo: repoNameSchema,
         query: z.string().min(1).max(300),
         path: z.string().min(1).max(2000).optional(),
         limit: z.number().int().min(1).max(2000).optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ query, path: inputPath, limit }) => {
+    async ({ repo: repoName, query, path: inputPath, limit }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath ?? ".");
         const maxItems = clamp(limit ?? MAX_SEARCH_RESULTS, 1, MAX_SEARCH_RESULTS);
 
@@ -535,7 +603,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const script = [
           "set -euo pipefail",
-          `cd ${shQuote(REPO_ROOT)}`,
+          `cd ${shQuote(repo.root)}`,
           `${shellJoin(grepArgs)} || true`,
         ].join("\n");
 
@@ -552,7 +620,8 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const limitedMatches = matches.slice(0, maxItems);
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           query,
           path: safePath,
           total: matches.length,
@@ -571,19 +640,21 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "search_files",
     {
-      description:
+      description: desc(
         "Search for files in the repository by filename pattern (glob or partial name match). " +
         "Patterns without wildcard characters are treated as partial matches (e.g. 'config' matches 'webpack.config.js'). " +
-        "Excludes .git, node_modules, and other denied paths.",
+        "Excludes .git, node_modules, and other denied paths."),
       inputSchema: {
+        repo: repoNameSchema,
         pattern: z.string().min(1).max(300),
         path: z.string().min(1).max(2000).optional(),
         maxResults: z.number().int().min(1).max(2000).optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ pattern, path: inputPath, maxResults }) => {
+    async ({ repo: repoName, pattern, path: inputPath, maxResults }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath ?? ".");
         const maxItems = clamp(maxResults ?? 50, 1, MAX_SEARCH_RESULTS);
 
@@ -593,7 +664,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const script = [
           "set -euo pipefail",
-          `cd ${shQuote(REPO_ROOT)}`,
+          `cd ${shQuote(repo.root)}`,
           `find ${shQuote(safePath)} \\( ${pruneExpr} \\) -prune -o -type f -name ${shQuote(namePattern)} -print | sed 's#^\\./##'`,
         ].join("\n");
 
@@ -606,7 +677,8 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const limitedFiles = allFiles.slice(0, maxItems);
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           pattern,
           path: safePath,
           total: allFiles.length,
@@ -625,16 +697,18 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "get_symbols",
     {
-      description:
+      description: desc(
         "List symbols (functions, classes, types, interfaces, enums, exports) in a file with line numbers. " +
-        "Optimised for TypeScript/JavaScript.",
+        "Optimised for TypeScript/JavaScript."),
       inputSchema: {
+        repo: repoNameSchema,
         path: z.string().min(1).max(2000),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ path: inputPath }) => {
+    async ({ repo: repoName, path: inputPath }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath);
 
         // Match common TS/JS top-level declaration patterns
@@ -649,7 +723,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const script = [
           "set -euo pipefail",
-          `cd ${shQuote(REPO_ROOT)}`,
+          `cd ${shQuote(repo.root)}`,
           `[ -f ${shQuote(safePath)} ] || { echo "File not found: ${safePath}" >&2; exit 1; }`,
           `grep -nE ${shQuote(pattern)} ${shQuote(safePath)} || true`,
         ].join("\n");
@@ -661,7 +735,8 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
           .filter((line) => line.length > 0);
 
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           path: safePath,
           total: symbols.length,
           symbols,
@@ -677,18 +752,20 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "git_blame",
     {
-      description:
+      description: desc(
         "Show per-line commit information for a repository file using git blame. " +
-        "Returns porcelain-format output for structured parsing.",
+        "Returns porcelain-format output for structured parsing."),
       inputSchema: {
+        repo: repoNameSchema,
         path: z.string().min(1).max(2000),
         startLine: z.number().int().min(1).max(2_000_000).optional(),
         endLine: z.number().int().min(1).max(2_000_000).optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ path: inputPath, startLine, endLine }) => {
+    async ({ repo: repoName, path: inputPath, startLine, endLine }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath);
 
         if (startLine !== undefined && endLine !== undefined && endLine < startLine) {
@@ -702,14 +779,15 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const script = [
           "set -euo pipefail",
-          `cd ${shQuote(REPO_ROOT)}`,
+          `cd ${shQuote(repo.root)}`,
           `[ -f ${shQuote(safePath)} ] || { echo "File not found: ${safePath}" >&2; exit 1; }`,
           `git blame ${rangeFlag} --porcelain -- ${shQuote(safePath)}`,
         ].join("\n");
 
         const result = await runRemoteScript(script);
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           path: safePath,
           startLine: startLine ?? null,
           endLine: endLine ?? null,
@@ -728,17 +806,19 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "write_file",
     {
-      description:
+      description: desc(
         "Create or overwrite a file in the repository. Content is written atomically via a temp file. " +
-        "Subject to deny-path filtering and size limits.",
+        "Subject to deny-path filtering and size limits."),
       inputSchema: {
+        repo: repoNameSchema,
         path: z.string().min(1).max(2000),
         content: z.string().max(MAX_WRITE_BYTES),
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ path: inputPath, content }) => {
+    async ({ repo: repoName, path: inputPath, content }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath);
         const contentBytes = Buffer.byteLength(content, "utf8");
         if (contentBytes > MAX_WRITE_BYTES) {
@@ -747,7 +827,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const script = [
           "set -euo pipefail",
-          `cd ${shQuote(REPO_ROOT)}`,
+          `cd ${shQuote(repo.root)}`,
           `mkdir -p $(dirname ${shQuote(safePath)})`,
           `tmp=$(mktemp ${shQuote(safePath + ".XXXXXX")})`,
           `cat > "$tmp"`,
@@ -758,9 +838,10 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
         const result = await withRetry("write_file", () => runRemoteScriptWithStdin(script, content));
         const writtenBytes = Number.parseInt(result.stdout.trim(), 10);
 
-        audit("write_file", { path: safePath, contentBytes, writtenBytes });
+        audit("write_file", { repo: repo.name, path: safePath, contentBytes, writtenBytes });
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           path: safePath,
           writtenBytes: Number.isFinite(writtenBytes) ? writtenBytes : contentBytes,
           stderr: clipText(result.stderr),
@@ -775,19 +856,21 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "delete_file",
     {
-      description: "Delete a file from the repository. Subject to deny-path filtering.",
+      description: desc("Delete a file from the repository. Subject to deny-path filtering."),
       inputSchema: {
+        repo: repoNameSchema,
         path: z.string().min(1).max(2000),
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ path: inputPath }) => {
+    async ({ repo: repoName, path: inputPath }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath);
 
         const script = [
           "set -euo pipefail",
-          `cd ${shQuote(REPO_ROOT)}`,
+          `cd ${shQuote(repo.root)}`,
           `[ -f ${shQuote(safePath)} ] || { echo "File not found: ${safePath}" >&2; exit 1; }`,
           `rm -f ${shQuote(safePath)}`,
           `echo "deleted"`,
@@ -795,9 +878,10 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const result = await withRetry("delete_file", () => runRemoteScript(script));
 
-        audit("delete_file", { path: safePath });
+        audit("delete_file", { repo: repo.name, path: safePath });
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           path: safePath,
           deleted: true,
           stderr: clipText(result.stderr),
@@ -812,25 +896,27 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "patch_file",
     {
-      description:
+      description: desc(
         "Replace a specific string in a repository file. " +
         "oldContent must match exactly once; the replacement is written atomically via a temp file. " +
-        "Subject to deny-path filtering and size limits.",
+        "Subject to deny-path filtering and size limits."),
       inputSchema: {
+        repo: repoNameSchema,
         path: z.string().min(1).max(2000),
         oldContent: z.string().min(1).max(MAX_WRITE_BYTES),
         newContent: z.string().max(MAX_WRITE_BYTES),
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ path: inputPath, oldContent, newContent }) => {
+    async ({ repo: repoName, path: inputPath, oldContent, newContent }) => {
       try {
+        const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath);
 
         // Step 1: read the file and verify size
         const readScript = [
           "set -euo pipefail",
-          `cd ${shQuote(REPO_ROOT)}`,
+          `cd ${shQuote(repo.root)}`,
           `[ -f ${shQuote(safePath)} ] || { echo "File not found: ${safePath}" >&2; exit 1; }`,
           `fileSize=$(wc -c < ${shQuote(safePath)})`,
           `if [ "$fileSize" -gt ${MAX_WRITE_BYTES} ]; then`,
@@ -855,7 +941,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
         // Step 2: write back atomically
         const writeScript = [
           "set -euo pipefail",
-          `cd ${shQuote(REPO_ROOT)}`,
+          `cd ${shQuote(repo.root)}`,
           `tmp=$(mktemp ${shQuote(safePath + ".XXXXXX")})`,
           `cat > "$tmp"`,
           `mv -f "$tmp" ${shQuote(safePath)}`,
@@ -867,9 +953,10 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
         );
         const writtenBytes = Number.parseInt(writeResult.stdout.trim(), 10);
 
-        audit("patch_file", { path: safePath, writtenBytes });
+        audit("patch_file", { repo: repo.name, path: safePath, writtenBytes });
         return okToolResult({
-          repoRoot: REPO_ROOT,
+          repo: repo.name,
+          repoRoot: repo.root,
           path: safePath,
           writtenBytes: Number.isFinite(writtenBytes) ? writtenBytes : Buffer.byteLength(patchedContent, "utf8"),
           stderr: clipText(writeResult.stderr),
@@ -1230,6 +1317,56 @@ function requiredStringFromEnv(name: string): string {
     throw new Error(`${name} is required`);
   }
   return raw.trim();
+}
+
+function parseRepoRoots(): Map<string, string> {
+  const map = new Map<string, string>();
+
+  // New multi-repo format: REPO_ROOTS=name1:/path1,name2:/path2
+  const multiRaw = process.env.REPO_ROOTS?.trim();
+  if (multiRaw) {
+    for (const entry of multiRaw.split(",")) {
+      const trimmed = entry.trim();
+      if (!trimmed) continue;
+      const colonIdx = trimmed.indexOf(":");
+      if (colonIdx <= 0) {
+        throw new Error(`Invalid REPO_ROOTS entry (expected name:/path): ${trimmed}`);
+      }
+      const name = trimmed.slice(0, colonIdx).trim();
+      const root = trimmed.slice(colonIdx + 1).trim();
+      if (!name || !root) {
+        throw new Error(`Invalid REPO_ROOTS entry (empty name or path): ${trimmed}`);
+      }
+      if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+        throw new Error(`Invalid repo name (alphanumeric, hyphens, underscores only): ${name}`);
+      }
+      if (map.has(name)) {
+        throw new Error(`Duplicate repo name in REPO_ROOTS: ${name}`);
+      }
+      map.set(name, root);
+    }
+  }
+
+  // Fallback: legacy single-repo REPO_ROOT
+  if (map.size === 0) {
+    const singleRoot = process.env.REPO_ROOT ?? "/srv/repos/project-repo";
+    const singleName = path.basename(singleRoot).replace(/[^a-zA-Z0-9_-]/g, "-") || "repo";
+    map.set(singleName, singleRoot);
+  }
+
+  return map;
+}
+
+function resolveRepo(repoName: string | undefined): RepoEntry {
+  if (!repoName) {
+    return DEFAULT_REPO;
+  }
+  const root = REPO_MAP.get(repoName);
+  if (!root) {
+    const available = REPO_LIST.map((r) => r.name).join(", ");
+    throw new Error(`Unknown repository: ${repoName}. Available: ${available}`);
+  }
+  return { name: repoName, root };
 }
 
 function boolFromEnv(name: string, fallback: boolean): boolean {
