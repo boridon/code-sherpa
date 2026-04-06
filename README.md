@@ -9,16 +9,28 @@
 ---
 
 ## What Is CodeSherpa?
-CodeSherpa is a remote MCP server that lets AI clients inspect repositories over SSH with a strict read-only toolset.
+CodeSherpa is a remote MCP server that lets AI clients explore and optionally modify repositories over SSH. Multiple repositories can be served from a single instance.
 
 Supported MCP tools:
-- `healthcheck_remote`
-- `list_files`
-- `read_file`
-- `search_code`
-- `git_status`
-- `git_diff`
-- `git_log`
+
+| Tool | Description | Scope |
+|------|-------------|-------|
+| `list_repos` | List available repositories | read |
+| `healthcheck_remote` | Check SSH connectivity and repo health | read |
+| `list_files` | List files/directories with deny-path filtering | read |
+| `read_file` | Read file contents with size limit | read |
+| `search_code` | Recursive text search (grep) | read |
+| `search_files` | File name pattern search (glob) | read |
+| `get_symbols` | Extract function/class/type declarations | read |
+| `git_status` | Git status | read |
+| `git_diff` | Git diff with optional range/path | read |
+| `git_log` | Git commit log | read |
+| `git_blame` | Per-line commit information | read |
+| `write_file` | Create or overwrite a file (atomic) | write |
+| `delete_file` | Delete a file | write |
+| `patch_file` | Search-and-replace in a file | write |
+
+Write tools are only available when the OAuth token includes the `mcp:write` scope.
 
 Compatible MCP clients:
 - ChatGPT (custom connectors)
@@ -42,6 +54,20 @@ Then connect your MCP client to:
 https://your-domain.example/mcp
 ```
 
+## Multi-Repository Support
+A single CodeSherpa instance can serve multiple repositories. Configure via `REPO_ROOTS`:
+
+```env
+REPO_ROOTS=frontend:/srv/repos/frontend,backend:/srv/repos/backend,infra:/srv/repos/infra
+```
+
+Format: `name1:/path1,name2:/path2,...`
+
+- All tools accept an optional `repo` parameter to select the target repository.
+- If `repo` is omitted, the first configured repository is used as the default.
+- Use `list_repos` to discover available repositories.
+- For single-repository setups, the legacy `REPO_ROOT` variable still works.
+
 ## Architecture
 ```text
 MCP Client
@@ -50,24 +76,25 @@ MCP Client
 CodeSherpa (HTTPS)
     |
     v
-SSH (read-only user)
+SSH (read-only or read-write user)
     |
     v
-Private repository host
+Private repository host (one or more repos)
 ```
 
 Key points:
 - Repository data stays on the SSH target host.
-- CodeSherpa exposes only read-only MCP tools.
+- Read-only by default; write tools require `mcp:write` OAuth scope.
 - Path traversal and sensitive path segments are blocked.
 - OAuth access tokens and legacy fixed bearer tokens are supported.
 
 ## Security Model
-- Use a read-only SSH user (no sudo).
+- Use a dedicated SSH user with minimal permissions (read-only recommended; grant write only if needed).
 - Denied path segments include `.git`, `.env`, `node_modules`, and similar sensitive paths.
 - Absolute paths and `..` traversal are rejected.
 - `/mcp` requires `mcp:read` scope for OAuth access tokens.
-- Legacy fixed bearer token auth can remain enabled for internal testing.
+- Write tools (`write_file`, `delete_file`, `patch_file`) require `mcp:write` scope.
+- Legacy fixed bearer token auth can remain enabled for internal testing (read-only scope only).
 
 Note: OAuth sessions, authorization codes, and tokens are in-memory in the current implementation. They are reset when the container restarts.
 
@@ -140,7 +167,7 @@ OAuth endpoints:
 
 OAuth profile:
 - Grant type: Authorization Code + PKCE (`S256`)
-- Scope: `mcp:read`
+- Scopes: `mcp:read` (read-only), `mcp:read mcp:write` (read + write)
 - Public client support: yes (`token_endpoint_auth_method=none` allowed)
 - Refresh token: supported
 
@@ -150,7 +177,7 @@ Use example values like these:
 - Issuer: `https://code-sherpa.example.com`
 - Authorization endpoint: `https://code-sherpa.example.com/authorize`
 - Token endpoint: `https://code-sherpa.example.com/token`
-- Scope: `mcp:read`
+- Scope: `mcp:read` (add `mcp:write` for write access)
 
 ## Environment Variables
 Use `.env.example` as the baseline.
@@ -159,19 +186,23 @@ Required:
 - `SSH_HOST`
 - `SSH_PORT`
 - `SSH_USERNAME`
-- `REPO_ROOT`
+- `REPO_ROOT` or `REPO_ROOTS` (at least one)
 - `MCP_BEARER_TOKEN` (for optional legacy/manual testing)
 - `OAUTH_ISSUER_BASE_URL`
 - `OAUTH_LOGIN_USERNAME`
 - `OAUTH_LOGIN_PASSWORD`
 - `OAUTH_SESSION_SECRET`
 
+Repository configuration:
+- `REPO_ROOT` — single repository path (legacy)
+- `REPO_ROOTS` — multiple repositories as `name1:/path1,name2:/path2` (takes precedence over `REPO_ROOT`)
+
 Optional/common:
 - `PORT` (default `8787`)
 - `MCP_SERVER_NAME` (default `code-sherpa`)
 - `MCP_SERVER_VERSION` (default `0.1.0`)
 - `OAUTH_COOKIE_SECURE` (default `true`)
-- `MAX_FILE_BYTES`, `MAX_SEARCH_RESULTS`, `MAX_LOG_COMMITS`, `MAX_RESPONSE_CHARS`
+- `MAX_FILE_BYTES`, `MAX_WRITE_BYTES`, `MAX_SEARCH_RESULTS`, `MAX_LOG_COMMITS`, `MAX_RESPONSE_CHARS`
 
 Example `.env` snippet (safe placeholders):
 
@@ -181,7 +212,7 @@ MCP_SERVER_NAME=code-sherpa
 SSH_HOST=ssh-host.example.internal
 SSH_PORT=22
 SSH_USERNAME=repo_reader
-REPO_ROOT=/srv/repos/project
+REPO_ROOTS=frontend:/srv/repos/frontend,backend:/srv/repos/backend
 OAUTH_ISSUER_BASE_URL=https://code-sherpa.example.com
 OAUTH_LOGIN_USERNAME=replace-me
 OAUTH_LOGIN_PASSWORD=replace-me
