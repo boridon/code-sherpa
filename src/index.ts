@@ -575,16 +575,19 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
   server.registerTool(
     "search_code",
     {
-      description: desc("Search text in repository using recursive grep with result limit."),
+      description: desc(
+        "Search text in repository using recursive grep with result limit. " +
+        "By default the query is matched as a fixed string; set regex=true to interpret it as an extended regular expression (ERE)."),
       inputSchema: {
         repo: repoNameSchema,
         query: z.string().min(1).max(300),
         path: z.string().min(1).max(2000).optional(),
         limit: z.number().int().min(1).max(2000).optional(),
+        regex: z.boolean().optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ repo: repoName, query, path: inputPath, limit }) => {
+    async ({ repo: repoName, query, path: inputPath, limit, regex }) => {
       try {
         const repo = resolveRepo(repoName);
         const safePath = normalizeRepoRelativePath(inputPath ?? ".");
@@ -592,7 +595,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
 
         const grepArgs = [
           "grep",
-          "-RIn",
+          regex ? "-REIn" : "-RFIn",
           "--binary-files=without-match",
           ...DENY_PATH_SEGMENTS.flatMap((segment) => ["--exclude-dir", segment]),
           ...DENY_PATH_SEGMENTS.flatMap((segment) => ["--exclude", segment]),
@@ -623,6 +626,7 @@ function createMcpServer(opts: { hasWriteScope: boolean }): McpServer {
           repo: repo.name,
           repoRoot: repo.root,
           query,
+          regex: Boolean(regex),
           path: safePath,
           total: matches.length,
           returned: limitedMatches.length,
