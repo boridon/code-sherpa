@@ -31,6 +31,9 @@ Supported MCP tools:
 | `patch_file` | Search-and-replace in a file | write |
 
 Write tools are only available when the OAuth token includes the `mcp:write` scope.
+Set `WRITE_ENABLED=false` to disable write tools entirely: they are never
+registered on the MCP server (even with the `mcp:write` scope), so clients
+do not see them at all. Defaults to `true`.
 
 Compatible MCP clients:
 - ChatGPT (custom connectors)
@@ -84,7 +87,7 @@ Private repository host (one or more repos)
 
 Key points:
 - Repository data stays on the SSH target host.
-- Read-only by default; write tools require `mcp:write` OAuth scope.
+- Read-only by default; write tools require `mcp:write` OAuth scope, and can be globally disabled with `WRITE_ENABLED=false`.
 - Path traversal and sensitive path segments are blocked.
 - OAuth access tokens and legacy fixed bearer tokens are supported.
 
@@ -202,6 +205,7 @@ Optional/common:
 - `MCP_SERVER_NAME` (default `code-sherpa`)
 - `MCP_SERVER_VERSION` (default `0.1.0`)
 - `OAUTH_COOKIE_SECURE` (default `true`)
+- `WRITE_ENABLED` (default `true`; set `false` for read-only — write tools are not exposed)
 - `MAX_FILE_BYTES`, `MAX_WRITE_BYTES`, `MAX_SEARCH_RESULTS`, `MAX_LOG_COMMITS`, `MAX_RESPONSE_CHARS`
 
 Example `.env` snippet (safe placeholders):

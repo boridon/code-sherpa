@@ -33,6 +33,8 @@ CodeSherpa は、SSH 越しにリポジトリを安全に探索・編集する�
 | `patch_file` | ファイル内の文字列置換 | write |
 
 書き込みツールは、OAuth トークンに `mcp:write` スコープが含まれている場合のみ利用可能です。
+`WRITE_ENABLED=false` を設定すると書き込みツールを完全に無効化できます。`mcp:write` スコープがあっても
+MCP サーバーに登録されないため、クライアントからは存在自体が見えません。デフォルトは `true` です。
 
 対応クライアント例:
 - ChatGPT（custom connectors）
@@ -91,7 +93,7 @@ SSH (読み取り専用 or 読み書きユーザー)
 
 ポイント:
 - リポジトリの実体は SSH 接続先ホストに残ります。
-- デフォルトは読み取り専用。書き込みツールには `mcp:write` OAuth スコープが必要です。
+- デフォルトは読み取り専用。書き込みツールには `mcp:write` OAuth スコープが必要で、`WRITE_ENABLED=false` で全体的に無効化できます。
 - パストラバーサルと機微なパスセグメントをブロックします。
 - OAuth アクセストークンと固定 Bearer トークンの両方を利用できます。
 
@@ -208,6 +210,7 @@ OAuth プロファイル:
 - `MCP_SERVER_NAME`（デフォルト `code-sherpa`）
 - `MCP_SERVER_VERSION`（デフォルト `0.1.0`）
 - `OAUTH_COOKIE_SECURE`（デフォルト `true`）
+- `WRITE_ENABLED`（デフォルト `true`。`false` で読み取り専用になり、書き込みツールは公開されません）
 - `MAX_FILE_BYTES`、`MAX_WRITE_BYTES`、`MAX_SEARCH_RESULTS`、`MAX_LOG_COMMITS`、`MAX_RESPONSE_CHARS`
 
 `.env` 例（安全なプレースホルダ）:
