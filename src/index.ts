@@ -38,6 +38,7 @@ const REPO_LIST: RepoEntry[] = [...REPO_MAP.entries()].map(([name, root]) => ({ 
 const DEFAULT_REPO = REPO_LIST[0];
 const MAX_FILE_BYTES = intFromEnv("MAX_FILE_BYTES", 100_000, { min: 1, max: 100_000_000 });
 const MAX_WRITE_BYTES = intFromEnv("MAX_WRITE_BYTES", 100_000, { min: 1, max: 100_000_000 });
+const WRITE_ENABLED = boolFromEnv("WRITE_ENABLED", true);
 const MAX_SEARCH_RESULTS = intFromEnv("MAX_SEARCH_RESULTS", 100, { min: 1, max: 2000 });
 const MAX_LOG_COMMITS = intFromEnv("MAX_LOG_COMMITS", 30, { min: 1, max: 500 });
 const MAX_RESPONSE_CHARS = intFromEnv("MAX_RESPONSE_CHARS", 200_000, { min: 1_000, max: 20_000_000 });
@@ -132,7 +133,7 @@ app.post("/mcp", async (req, res) => {
     }
 
     const scopes: string[] = res.locals.authScopes ?? [];
-    const server = createMcpServer({ hasWriteScope: scopes.includes("mcp:write") });
+    const server = createMcpServer({ hasWriteScope: WRITE_ENABLED && scopes.includes("mcp:write") });
     let transport: StreamableHTTPServerTransport;
     transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
