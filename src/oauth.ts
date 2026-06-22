@@ -1,5 +1,5 @@
 import express, { type Request, type Response } from "express";
-import { secureEqual, verifyPkceS256 } from "./pkce.js";
+import { generateRandomToken, secureEqual, verifyPkceS256 } from "./pkce.js";
 import { extractSignedSessionId, getCookieValue, SessionStore, signedSessionValue } from "./session.js";
 import { type OAuthScope, OAuthInMemoryStore } from "./token-store.js";
 
@@ -35,6 +35,9 @@ export function createOAuthModule(options: CreateOAuthModuleOptions) {
   const issuer = trimTrailingSlash(options.issuerBaseUrl);
   const authorizationEndpoint = `${issuer}/authorize`;
   const tokenEndpoint = `${issuer}/token`;
+  const registrationEndpoint = `${issuer}/register`;
+  const resourceUrl = `${issuer}/mcp`;
+  const protectedResourceMetadataUrl = `${issuer}/.well-known/oauth-protected-resource`;
 
   const store = new OAuthInMemoryStore();
   const sessions = new SessionStore();
@@ -42,11 +45,49 @@ export function createOAuthModule(options: CreateOAuthModuleOptions) {
   const router = express.Router();
 
   router.get("/.well-known/oauth-authorization-server", (_req, res) => {
-    res.json(buildDiscoveryDocument(issuer, authorizationEndpoint, tokenEndpoint));
+    res.json(buildDiscoveryDocument(issuer, authorizationEndpoint, tokenEndpoint, registrationEndpoint));
   });
 
   router.get("/.well-known/openid-configuration", (_req, res) => {
-    res.json(buildDiscoveryDocument(issuer, authorizationEndpoint, tokenEndpoint));
+    res.json(buildDiscoveryDocument(issuer, authorizationEndpoint, tokenEndpoint, registrationEndpoint));
+  });
+
+  // RFC 9728 Protected Resource Metadata. Some clients append the resource path
+  // (".../oauth-protected-resource/mcp"), so serve both shapes.
+  const protectedResourceHandler = (_req: Request, res: Response) => {
+    res.json(buildProtectedResourceMetadata(resourceUrl, issuer));
+  };
+  router.get("/.well-known/oauth-protected-resource", protectedResourceHandler);
+  router.get("/.well-known/oauth-protected-resource/mcp", protectedResourceHandler);
+
+  // RFC 7591 Dynamic Client Registration. This server uses public PKCE clients
+  // and does not bind issued tokens to a registered client secret, so we accept
+  // the client's metadata and return a generated client_id.
+  router.post("/register", (req, res) => {
+    const body = isObject(req.body) ? req.body : {};
+    const redirectUris = Array.isArray(body.redirect_uris)
+      ? body.redirect_uris.filter((uri): uri is string => typeof uri === "string" && isValidRedirectUri(uri))
+      : [];
+
+    const clientId = `dcr_${generateRandomToken(18)}`;
+    const issuedAt = Math.floor(Date.now() / 1000);
+
+    options.logger("oauth_client_registered", {
+      client_id: clientId,
+      client_name: asString(body.client_name) || null,
+      redirect_uris: redirectUris,
+    });
+
+    res.status(201).json({
+      client_id: clientId,
+      client_id_issued_at: issuedAt,
+      redirect_uris: redirectUris,
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      scope: "mcp:read mcp:write",
+      ...(asString(body.client_name) ? { client_name: asString(body.client_name) } : {}),
+    });
   });
 
   router.get("/authorize", (req, res) => {
@@ -317,7 +358,7 @@ export function createOAuthModule(options: CreateOAuthModuleOptions) {
     return { ok: false };
   }
 
-  return { router, authenticateMcpBearer };
+  return { router, authenticateMcpBearer, protectedResourceMetadataUrl };
 }
 
 function handleAuthorizationCodeGrant(req: Request, res: Response, store: OAuthInMemoryStore, logger: Logger): void {
@@ -638,11 +679,17 @@ function getUserSession(req: Request, sessions: SessionStore, secret: string) {
   return sessions.get(sessionId);
 }
 
-function buildDiscoveryDocument(issuer: string, authorizationEndpoint: string, tokenEndpoint: string) {
+function buildDiscoveryDocument(
+  issuer: string,
+  authorizationEndpoint: string,
+  tokenEndpoint: string,
+  registrationEndpoint: string,
+) {
   return {
     issuer,
     authorization_endpoint: authorizationEndpoint,
     token_endpoint: tokenEndpoint,
+    registration_endpoint: registrationEndpoint,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
@@ -650,6 +697,19 @@ function buildDiscoveryDocument(issuer: string, authorizationEndpoint: string, t
     scopes_supported: ["mcp:read", "mcp:write"],
     authorization_response_iss_parameter_supported: true,
   };
+}
+
+function buildProtectedResourceMetadata(resourceUrl: string, issuer: string) {
+  return {
+    resource: resourceUrl,
+    authorization_servers: [issuer],
+    scopes_supported: ["mcp:read", "mcp:write"],
+    bearer_methods_supported: ["header"],
+  };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function appendQuery(baseUrl: string, params: Record<string, string>): string {

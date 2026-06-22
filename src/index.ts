@@ -101,6 +101,10 @@ app.get("/health", (_req, res) => {
 app.use("/mcp", (req, res, next) => {
   const authResult = oauthModule.authenticateMcpBearer(req.header("authorization") ?? undefined);
   if (!authResult.ok) {
+    res.set(
+      "WWW-Authenticate",
+      `Bearer resource_metadata="${oauthModule.protectedResourceMetadataUrl}"`,
+    );
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
