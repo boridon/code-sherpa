@@ -31,11 +31,13 @@ services:
       OAUTH_LOGIN_PASSWORD: "${OAUTH_LOGIN_PASSWORD:?OAUTH_LOGIN_PASSWORD is required}"
       OAUTH_SESSION_SECRET: "${OAUTH_SESSION_SECRET:?OAUTH_SESSION_SECRET is required}"
       OAUTH_COOKIE_SECURE: "${OAUTH_COOKIE_SECURE:-true}"
+      TOKEN_STORE_PATH: "${TOKEN_STORE_PATH:-/app/data/tokens.json}"
     ports:
       - "8787:8787"
     volumes:
       - ./secrets/id_ed25519:/run/secrets/id_ed25519:ro
       - ./secrets/known_hosts:/run/secrets/known_hosts:ro
+      - ./data:/app/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
       interval: 30s

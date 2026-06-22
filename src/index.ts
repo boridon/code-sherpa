@@ -48,6 +48,7 @@ const OAUTH_LOGIN_USERNAME = requiredStringFromEnv("OAUTH_LOGIN_USERNAME");
 const OAUTH_LOGIN_PASSWORD = requiredStringFromEnv("OAUTH_LOGIN_PASSWORD");
 const OAUTH_SESSION_SECRET = requiredStringFromEnv("OAUTH_SESSION_SECRET");
 const OAUTH_COOKIE_SECURE = boolFromEnv("OAUTH_COOKIE_SECURE", OAUTH_ISSUER_BASE_URL.startsWith("https://"));
+const TOKEN_STORE_PATH = process.env.TOKEN_STORE_PATH?.trim() || "/app/data/tokens.json";
 
 const DENY_PATH_SEGMENTS = (process.env.DENY_PATH_SEGMENTS ?? ".git,node_modules,dist,build,.next,.turbo,.cache,.env,.env.local,.env.production,.ssh")
   .split(",")
@@ -71,6 +72,7 @@ const oauthModule = createOAuthModule({
   sessionSecret: OAUTH_SESSION_SECRET,
   fixedBearerToken: MCP_BEARER_TOKEN,
   secureCookies: OAUTH_COOKIE_SECURE,
+  tokenStorePath: TOKEN_STORE_PATH,
   logger: audit,
 });
 app.use(oauthModule.router);
@@ -99,8 +101,19 @@ app.get("/health", (_req, res) => {
 });
 
 app.use("/mcp", (req, res, next) => {
-  const authResult = oauthModule.authenticateMcpBearer(req.header("authorization") ?? undefined);
+  const authHeader = req.header("authorization") ?? undefined;
+  audit("mcp_request_received", {
+    method: req.method,
+    hasAuthorizationHeader: Boolean(authHeader),
+    hasSession: typeof req.headers["mcp-session-id"] === "string",
+    accept: req.header("accept") ?? null,
+  });
+  const authResult = oauthModule.authenticateMcpBearer(authHeader);
   if (!authResult.ok) {
+    audit("mcp_auth_failed", {
+      method: req.method,
+      hasAuthorizationHeader: Boolean(authHeader),
+    });
     res.set(
       "WWW-Authenticate",
       `Bearer resource_metadata="${oauthModule.protectedResourceMetadataUrl}"`,

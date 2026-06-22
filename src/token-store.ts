@@ -1,3 +1,5 @@
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { generateRandomToken } from "./pkce.js";
 
 export type OAuthScope = "mcp:read" | "mcp:write";
@@ -45,6 +47,62 @@ export class OAuthInMemoryStore {
   private readonly authCodes = new Map<string, AuthorizationCode>();
   private readonly accessTokens = new Map<string, AccessTokenRecord>();
   private readonly refreshTokens = new Map<string, RefreshTokenRecord>();
+  private readonly persistPath: string | null;
+
+  // Only access/refresh tokens are persisted across restarts; short-lived
+  // authorization requests and codes are intentionally kept in memory only.
+  constructor(persistPath?: string | null) {
+    this.persistPath = persistPath ? persistPath : null;
+    if (this.persistPath) {
+      this.load();
+    }
+  }
+
+  private load(): void {
+    let raw: string;
+    try {
+      raw = readFileSync(this.persistPath!, "utf8");
+    } catch {
+      return; // first run / no file yet
+    }
+    try {
+      const data = JSON.parse(raw) as {
+        accessTokens?: unknown[];
+        refreshTokens?: unknown[];
+      };
+      const now = Date.now();
+      for (const record of data.accessTokens ?? []) {
+        if (isTokenRecord(record) && record.expiresAt > now) {
+          this.accessTokens.set(record.token, record);
+        }
+      }
+      for (const record of data.refreshTokens ?? []) {
+        if (isTokenRecord(record) && record.expiresAt > now) {
+          this.refreshTokens.set(record.token, record);
+        }
+      }
+    } catch {
+      // corrupt file → start empty rather than crash
+    }
+  }
+
+  private persist(): void {
+    if (!this.persistPath) {
+      return;
+    }
+    try {
+      const payload = JSON.stringify({
+        accessTokens: [...this.accessTokens.values()],
+        refreshTokens: [...this.refreshTokens.values()],
+      });
+      mkdirSync(dirname(this.persistPath), { recursive: true });
+      const tmp = `${this.persistPath}.tmp`;
+      writeFileSync(tmp, payload, { mode: 0o600 });
+      renameSync(tmp, this.persistPath);
+    } catch {
+      // best-effort: never let a persistence failure break the auth flow
+    }
+  }
 
   createAuthorizationRequest(input: Omit<AuthorizationRequest, "id" | "expiresAt">, ttlMs: number): AuthorizationRequest {
     this.cleanupExpired();
@@ -100,6 +158,7 @@ export class OAuthInMemoryStore {
       expiresAt: Date.now() + ttlSec * 1000,
     };
     this.accessTokens.set(token.token, token);
+    this.persist();
     return token;
   }
 
@@ -116,6 +175,7 @@ export class OAuthInMemoryStore {
       expiresAt: Date.now() + ttlSec * 1000,
     };
     this.refreshTokens.set(token.token, token);
+    this.persist();
     return token;
   }
 
@@ -126,6 +186,7 @@ export class OAuthInMemoryStore {
       return null;
     }
     this.refreshTokens.delete(token);
+    this.persist();
     return record;
   }
 
@@ -156,4 +217,19 @@ export class OAuthInMemoryStore {
       }
     }
   }
+}
+
+function isTokenRecord(value: unknown): value is AccessTokenRecord & RefreshTokenRecord {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.token === "string" &&
+    typeof record.clientId === "string" &&
+    typeof record.userId === "string" &&
+    typeof record.expiresAt === "number" &&
+    Array.isArray(record.scopes) &&
+    record.scopes.every((scope) => scope === "mcp:read" || scope === "mcp:write")
+  );
 }

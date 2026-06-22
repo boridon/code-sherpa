@@ -12,6 +12,7 @@ export type CreateOAuthModuleOptions = {
   sessionSecret: string;
   fixedBearerToken?: string;
   secureCookies: boolean;
+  tokenStorePath?: string | null;
   logger: Logger;
 };
 
@@ -39,7 +40,7 @@ export function createOAuthModule(options: CreateOAuthModuleOptions) {
   const resourceUrl = `${issuer}/mcp`;
   const protectedResourceMetadataUrl = `${issuer}/.well-known/oauth-protected-resource`;
 
-  const store = new OAuthInMemoryStore();
+  const store = new OAuthInMemoryStore(options.tokenStorePath);
   const sessions = new SessionStore();
 
   const router = express.Router();
